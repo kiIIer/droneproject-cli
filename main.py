@@ -1,5 +1,7 @@
 import argparse
-from video_splitter import setup_cli
+
+import presence_detector
+import video_splitter
 
 
 def main():
@@ -7,7 +9,8 @@ def main():
     subparsers = parser.add_subparsers(dest='command')
     subparsers.required = True
 
-    setup_cli(subparsers)
+    video_splitter.setup_cli(subparsers)
+    presence_detector.setup_cli(subparsers)
 
     args = parser.parse_args()
     if hasattr(args, 'func'):
