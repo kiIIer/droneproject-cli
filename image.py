@@ -17,7 +17,7 @@ def load_and_preprocess_image(image, input_shape=(640, 640)):
 
 
 def analyze_and_modify_image(onnx_model_path, image, threshold=0.5, iou_threshold=0.5):
-    preprocessed_image, resized_image = preprocess_image(image)
+    preprocessed_image, _ = preprocess_image(image)
 
     session = ort.InferenceSession(onnx_model_path)
     input_name = session.get_inputs()[0].name
@@ -25,49 +25,18 @@ def analyze_and_modify_image(onnx_model_path, image, threshold=0.5, iou_threshol
 
     output_data = outputs[0][0]
 
-    # Collect boxes that meet the threshold
     boxes = []
-    scores = []
-    class_confidences = []
+    objectness_scores = []
     for detection in output_data:
-        center_x, center_y, width, height, objectness, human_confidence, vehicle_confidence = detection
+        center_x, center_y, width, height, objectness, _, _ = detection
         if objectness > threshold:
             boxes.append([center_x, center_y, width, height])
-            scores.append(objectness)
-            class_confidences.append((human_confidence, vehicle_confidence))
+            objectness_scores.append(objectness)
 
-    # Convert to numpy arrays
-    boxes = np.array(boxes)
-    scores = np.array(scores)
+    selected_indices = non_max_suppression(np.array(boxes), np.array(objectness_scores), iou_threshold)
+    selected_boxes = [boxes[i] for i in selected_indices]
 
-    # Apply Non-Maximum Suppression
-    selected_indices = non_max_suppression(boxes, scores, iou_threshold)
-    selected_boxes = boxes[selected_indices]
-    selected_class_confidences = np.array(class_confidences)[selected_indices]
-
-    # Draw the selected boxes and class text on the image
-    for box, class_confidence in zip(selected_boxes, selected_class_confidences):
-        center_x, center_y, width, height = box
-        scale_x, scale_y = resized_image.shape[1] / 640, resized_image.shape[0] / 640
-        top_left_x = int((center_x - (width / 2)) * scale_x)
-        top_left_y = int((center_y - (height / 2)) * scale_y)
-        bottom_right_x = int((center_x + (width / 2)) * scale_x)
-        bottom_right_y = int((center_y + (height / 2)) * scale_y)
-
-        # Determine the class based on the higher confidence score
-        class_text = "Human" if class_confidence[0] > class_confidence[1] else "Vehicle"
-
-        # Draw the bounding box on the image
-        cv2.rectangle(resized_image, (top_left_x, top_left_y),
-                      (bottom_right_x, bottom_right_y),
-                      (0, 255, 0), 2)
-
-        # Put the class text below the bounding box
-        text_location = (top_left_x, bottom_right_y + 15)  # Adjust the 15 pixels offset as needed
-        cv2.putText(resized_image, class_text, text_location, cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 2)
-
-    return resized_image
+    return selected_boxes
 
 
 def non_max_suppression(boxes, scores, iou_threshold):
@@ -115,43 +84,58 @@ def preprocess_image(image, input_shape=(640, 640)):
     return image_batch, image_resized
 
 
-def process_video_to_frames(input_video_path, output_folder, onnx_model_path, threshold=0.5, iou_threshold=0.5):
-    # Create the output folder if it doesn't exist
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+def draw_rectangles_on_frame(frame, boxes, input_shape=(640, 640)):
+    frame_height, frame_width = frame.shape[:2]
+    scale_x, scale_y = frame_width / input_shape[0], frame_height / input_shape[1]
 
+    for box in boxes:
+        center_x, center_y, width, height = box
+        center_x *= scale_x
+        center_y *= scale_y
+        width *= scale_x
+        height *= scale_y
+
+        top_left_x = int(center_x - width / 2)
+        top_left_y = int(center_y - height / 2)
+        bottom_right_x = int(center_x + width / 2)
+        bottom_right_y = int(center_y + height / 2)
+
+        cv2.rectangle(frame, (top_left_x, top_left_y), (bottom_right_x, bottom_right_y), (0, 255, 0), 2)
+
+    return frame
+
+
+def process_video(input_video_path, output_video_path, onnx_model_path, threshold=0.5, iou_threshold=0.5):
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
         raise IOError("Error opening video stream or file at " + input_video_path)
 
-    frame_count = 0
-    max_frames = 500  # Set a limit to the number of frames to process
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
 
-    try:
-        while cap.isOpened() and frame_count < max_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
 
-            modified_frame = analyze_and_modify_image(onnx_model_path, frame, threshold, iou_threshold)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            # Save the modified frame to the output folder
-            frame_filename = os.path.join(output_folder, f"frame_{frame_count:04d}.png")
-            cv2.imwrite(frame_filename, modified_frame)
+        boxes = analyze_and_modify_image(onnx_model_path, frame, threshold, iou_threshold)
+        modified_frame = draw_rectangles_on_frame(frame, boxes, input_shape=(640, 640))
 
-            frame_count += 1
-    except Exception as e:
-        print(f"Error processing video: {e}")
-    finally:
-        cap.release()
+        out.write(modified_frame)
 
-    print("Video processing completed. Processed frames:", frame_count)
+    cap.release()
+    out.release()
 
 
 # Example usage:
 input_video_path = 'test-files/3.MP4'
-output_folder = 'test-files/out'
+output_folder = 'test-files/3_boxed.mp4'
 onnx_model_path = 'test-files/best.onnx'
 
 # Process the video
-process_video_to_frames(input_video_path, output_folder, onnx_model_path)
+process_video(input_video_path, output_folder, onnx_model_path)
